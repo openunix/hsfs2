@@ -1,3 +1,5 @@
 include $(top_srcdir)/Makefile.common
 
-SUBDIRS = nfs3 nfs_common lib fuse man 
+ACLOCAL_AMFLAGS = -I m4
+
+SUBDIRS = nfs3 nfs_common lib hsfs man

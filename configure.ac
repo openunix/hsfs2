@@ -1,12 +1,12 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
-
+AC_INIT([hsfs], [0.4])
 AC_PREREQ([2.60])
-AC_INIT([hsfs], [0.3], [steve.shuo.feng@gmail.com])
-AC_CONFIG_SRCDIR([fuse/hsfs_main.c])
+AC_CONFIG_MACRO_DIR([m4])
+AC_CONFIG_SRCDIR([hsfs/hsfs_main.c])
 AC_CONFIG_HEADERS([include/config.h])
 
-AM_INIT_AUTOMAKE
+AM_INIT_AUTOMAKE([foreign])
 
 # SLES 11SP2 (automake-1.10.1) doesn't have this
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
@@ -60,11 +60,6 @@ AC_CHECK_MEMBERS([struct stat.st_atimespec])
 AC_C_INLINE
 
 # Checks for library functions.
-AC_FUNC_CHOWN
-AC_FUNC_LSTAT_FOLLOWS_SLASHED_SYMLINK
-AC_FUNC_MALLOC
-AC_FUNC_REALLOC
-AC_CHECK_FUNCS([alarm gethostbyname hasmntopt inet_ntoa memset realpath socket strchr strcspn strdup strerror strrchr strstr uname])
 
 # Check for system service
 AC_SYS_LARGEFILE
@@ -84,7 +79,7 @@ else
 fi
 
 AC_CONFIG_FILES([Makefile
-                 fuse/Makefile
+                 hsfs/Makefile
                  nfs3/Makefile
                  man/Makefile
 		 lib/Makefile
