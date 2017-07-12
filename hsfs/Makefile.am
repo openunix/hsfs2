@@ -1,13 +1,23 @@
-include $(top_srcdir)/Makefile.common
+
+AM_CFLAGS = -Wall -Wextra
+
+if BUILD_FUSE
+  FUSE_FLAGS = -I../fuse/include -D_FILE_OFFSET_BITS=64
+  FUSE_LIB = $(top_builddir)/fuse/lib/libfuse3.la
+else
+  FUSE_FLAGS = `pkg-config fuse --cflags`
+endif
+
+AM_CPPFLAGS = $(FUSE_FLAGS)
 
 bin_PROGRAMS = hsfs
-hsfs_CPPFLAGS = $(AM_CFLAGS) -g -Wall -I/usr/include/tirpc/ \
-			`pkg-config fuse --cflags` 
-hsfs_LDFLAGS = `pkg-config fuse --libs`
-hsfs_LDADD = $(top_builddir)/hsfs/libhsx_fuse.a $(top_builddir)/nfs3/libhsi_nfs3.a \
-	$(top_builddir)/lib/libhsfs.a $(top_builddir)/nfs_common/libhsi_nfsc.a
-hsfs_SOURCES = xcommon.c hsfs_main.c
+hsfs_LDADD = $(FUSE_LIB) $(NFS3_LIB) $(NFSC_LIB) # $(top_builddir)/lib/libhsfs.a
+hsfs_SOURCES = xcommon.c hsfs_main.c ../nfs3/fstab.c ../nfs3/nfs_mntent.c hsx_fuse_init.c
 
+if BUILD_NFS3
+  NFS3_LIB = $(top_builddir)/nfs3/libhsi_nfs3.a
+  NFSC_LIB = $(top_builddir)/nfs_common/libhsi_nfsc.a
+  NFS3_FLAGS = -DBUILD_NFS3
 noinst_LIBRARIES = libhsx_fuse.a
 libhsx_fuse_a_CPPFLAGS = $(AM_CFLAGS) -g -Wall -I/usr/include/tirpc/ \
 			`pkg-config fuse --cflags`
@@ -20,4 +30,4 @@ libhsx_fuse_a_SOURCES = hsx_fuse_getattr.c hsx_fuse_statfs.c hsx_fuse_init.c \
 			hsx_fuse_opendir.c hsx_fuse_setxattr.c \
 			hsx_fuse_mknod.c hsx_fuse_link.c hsx_fuse_create.c \
 			hsx_fuse_access.c hsx_fuse_getxattr.c hsx_fuse_stat2iattr.c
-
+endif

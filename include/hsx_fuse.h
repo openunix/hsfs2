@@ -3,6 +3,12 @@
 #define __HSX_FUSE_H__ 
 
 #include <sys/stat.h>
+
+#ifndef FUSE_USE_VERSION
+#define FUSE_USE_VERSION 30
+#endif
+#include <fuse_lowlevel.h>
+
 #include <hsfs.h>
 
 extern void hsx_fuse_init(void *data, struct fuse_conn_info *conn);

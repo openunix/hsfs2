@@ -41,7 +41,7 @@ static struct option hsfs_opts[] = {
 	{ NULL, 0, 0, 0 }
 };
 
-void hsi_mount_usage()
+static void print_usage(void)
 {
 	printf("usage: %s remotetarget dir [-rvVwfnh] [-t version] [-o hsfsoptions]\n", progname);
 	printf("options:\n\t-r\t\tMount file system readonly\n");
@@ -53,12 +53,16 @@ void hsi_mount_usage()
 	printf("\t-h\t\tPrint this help\n");
 	printf("\tversion\t\thsfs - currently, the only choice\n");
 	printf("\thsfsoptions\tRefer mount.hsfs(8) or hsfs(5)\n\n");
+        fuse_cmdline_help();
+        fuse_lowlevel_help();
 	exit(0);
 }
 
-static inline void hsi_print_version(void)
+static void print_version(void)
 {
 	printf("%s.\n", PACKAGE_STRING);
+        printf("FUSE library version %s\n", fuse_pkgversion());
+        fuse_lowlevel_version();
 	exit(0);
 }
 
@@ -74,6 +78,11 @@ static inline int hsi_fuse_add_opt(struct fuse_args *args, const char *opt)
 	return fuse_opt_add_opt(opts, opt);
 }
 
+static struct fuse_lowlevel_ops hsfs_raw_ops = {
+        .init = hsx_fuse_init,
+};
+
+#ifdef BUILD_NFS3
 static struct fuse_lowlevel_ops hsfs_oper = {
 	.init = hsx_fuse_init,
 	.getattr = hsx_fuse_getattr,
@@ -103,6 +112,7 @@ static struct fuse_lowlevel_ops hsfs_oper = {
 	.readdirplus = hsx_fuse_readdir_plus,
 #endif
 };
+#endif
 
 /*
  * Map from -o and fstab option strings to the flag argument to mount(2).
@@ -297,7 +307,7 @@ static void hsi_parse_opt(const char *opt, int *flags, struct fuse_args *args,
 				WARNING("Not supported opt: %s.", opt);
 			}
 			return;
-		} else if (fuse_lowlevel_is_lib_option(opt)) {
+		} else {
 			hsi_fuse_add_opt(args, opt);
 			return;
 		}
@@ -360,9 +370,6 @@ static int hsi_parse_cmdline(int argc, char **argv, int *flags,
 		case 'v':
 			++verbose;
 			break;
-		case 'V':
-			hsi_print_version();
-			break;
 		case 'w':
 			*flags &= ~MS_RDONLY;
 			break;
@@ -377,14 +384,14 @@ static int hsi_parse_cmdline(int argc, char **argv, int *flags,
 			break;
 		case 'h':
 		default:
-			hsi_mount_usage();
+			print_usage();
 			break;
 			
 		}
 	}
 
 	if (optind != argc)
-		hsi_mount_usage();
+		print_usage();
 
 	/* add subtype args */
 	{
@@ -415,7 +422,7 @@ out:
 int main(int argc, char **argv)
 {
 	struct fuse_args args;
-	struct fuse_chan *ch = NULL;
+        struct fuse_cmdline_opts opts;
 	struct fuse_session *se = NULL;
 	char *mountpoint = NULL, *mountspec = NULL, *udata = NULL;
 	struct hsfs_super super;
@@ -426,15 +433,8 @@ int main(int argc, char **argv)
 
 	progname = basename(argv[0]);
 
-	if (argv[1] && argv[1][0] == '-') {
-		if(argv[1][1] == 'V')
-			hsi_print_version();
-		else
-			hsi_mount_usage();
-	}
-
 	if (argc < 3)
-		hsi_mount_usage();
+		print_usage();
 
 	mountspec = argv[1];
 	mountpoint = argv[2];
@@ -445,6 +445,22 @@ int main(int argc, char **argv)
 	if (err != 0)
 		goto out;
 
+        if (fuse_parse_cmdline(&args, &opts) != 0) {
+                print_usage();
+                goto out;
+        }
+
+        if (opts.show_help) {
+                print_usage();
+                err = 0;
+                goto err_out1;
+        }
+        else if (opts.show_version) {
+                print_version();
+                err = 0;
+                goto err_out1;
+        }
+#if 0
 	err = hsfs_init();
 	if (err)
 		goto out;
@@ -452,26 +468,38 @@ int main(int argc, char **argv)
 	ch = hsx_fuse_mount(mountspec, mountpoint, &args, udata, &super);
 	if (ch == NULL)
 		goto out;
-
+#endif
 	if (getuid() == 0)
 		hsi_add_mtab(mountspec, mountpoint, HSFS_TYPE, super.flags,
 			 udata);
 
-	se = fuse_lowlevel_new(&args, &hsfs_oper, sizeof(hsfs_oper), &super);
-	if (se != NULL) {
-		if (fuse_set_signal_handlers(se) != -1) {
-			fuse_session_add_chan(se, ch);
+        se = fuse_session_new(&args, &hsfs_raw_ops, sizeof(hsfs_raw_ops), &super);
+        if (se == NULL)
+                goto err_out1;
+
+        if (fuse_set_signal_handlers(se) != 0)
+                goto err_out2;
+
+        if (fuse_session_mount(se, opts.mountpoint) != 0)
+                goto err_out3;
+
+        fuse_daemonize(opts.foreground);
+
+        if (opts.singlethread)
 			err = fuse_session_loop(se);
-			fuse_remove_signal_handlers(se);
-			fuse_session_remove_chan(ch);
-		}
-		fuse_session_destroy(se);
-	}
+        else
+                err = fuse_session_loop_mt(se, opts.clone_fd);
 	
 	if (getuid() == 0)
 		hsi_del_mtab(mountpoint);
 
-	hsx_fuse_unmount(mountspec, mountpoint, ch, &super);
+	fuse_session_unmount(se);
+err_out3:
+        fuse_remove_signal_handlers(se);
+err_out2:
+        fuse_session_destroy(se);
+err_out1:
+        free(opts.mountpoint);
 out:
 	if (udata)
 		free(udata);

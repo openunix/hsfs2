@@ -31,7 +31,38 @@ AC_GNU_SOURCE
 AC_PROG_LIBTOOL
 
 # Checks for libraries.
-AC_CHECK_LIB([fuse], [fuse_lowlevel_new], [], AC_MSG_ERROR([You need libfuse to run.]))
+AC_ARG_WITH([system-fuse],
+        [AS_HELP_STRING([--without-system-fuse],
+                [build without system fuse (requires git access to github)])],
+        [],
+        [with_system_fuse=yes])
+AS_IF([test "x$with_system_fuse" == xyes],
+        [AC_CHECK_LIB([fuse3], [fuse_session_new], [],
+                [no_fuse_lib=yes])]
+        [AS_IF([test -f "fuse/configure.ac"], [],
+                [no_fuse_lib=yes])])
+AS_IF([test "x$no_fuse_lib" == xyes],
+        AC_MSG_ERROR([
+FUSE (libfuse) version >= 3.0.0 not present. Your options:
+  (1) Preferred: Install the FUSE (libfuse 3.0.0 or higher) devel package
+  (2) Fetch the FUSE submodule by using below command and ./configure --without-system-fuse
+      git submodule update --init fuse]))
+
+if test "x$with_system_fuse" != "xyes"; then
+        source_dir=$(pwd)
+        cd fuse && ./makeconf.sh
+        [[ $? != 0 ]] && no_fuse_lib=yes
+        cd $source_dir
+fi
+# Broken FUSE tree
+AS_IF([test "x$no_fuse_lib" == xyes],
+        AC_MSG_ERROR([
+FUSE submodule broken ("git submodule update --init fuse" required?)]),
+        AC_CONFIG_SUBDIRS([fuse]))
+
+AM_CONDITIONAL([BUILD_FUSE], [test x"$with_system_fuse" != xyes])
+AM_CONDITIONAL([BUILD_NFS3], [test x"$with_nfs3" == xyes])
+
 AC_CHECK_LIB([tirpc], [clnt_tp_create], [], AC_MSG_ERROR([You need libtirpc to run.]))
 
 # Checks for header files.

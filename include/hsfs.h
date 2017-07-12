@@ -5,11 +5,6 @@
 #include <hsfs/types.h>
 #include <assert.h>
 
-#ifndef FUSE_USE_VERSION
-#define FUSE_USE_VERSION 26
-#endif
-
-#include <fuse/fuse_lowlevel.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>

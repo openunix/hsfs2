@@ -1,5 +1,13 @@
-include $(top_srcdir)/Makefile.common
 
 ACLOCAL_AMFLAGS = -I m4
 
-SUBDIRS = nfs3 nfs_common lib hsfs man
+if BUILD_FUSE
+  FUSE_DIR = fuse
+endif
+
+if BUILD_NFS3
+  NFS3_DIR = nfs3
+  NFSC_DIR = nfs_common
+endif
+
+SUBDIRS = $(FUSE_DIR) $(NFS3_DIR) $(NFSC_DIR) lib hsfs man
