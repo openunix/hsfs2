@@ -12,7 +12,7 @@ AM_CPPFLAGS = $(FUSE_FLAGS)
 
 bin_PROGRAMS = hsfs
 hsfs_LDADD = $(FUSE_LIB) $(NFS3_LIB) $(NFSC_LIB) # $(top_builddir)/lib/libhsfs.a
-hsfs_SOURCES = xcommon.c hsfs_main.c ../nfs3/fstab.c ../nfs3/nfs_mntent.c hsx_fuse_init.c
+hsfs_SOURCES = hsfs_main.c
 
 if BUILD_NFS3
   NFS3_LIB = $(top_builddir)/nfs3/libhsi_nfs3.a

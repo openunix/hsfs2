@@ -1,47 +1,97 @@
+/*
+ * Copyright (C) 2012, 2017 Feng Shuo <steve.shuo.feng@gmail.com>
+ *
+ * This file is part of VirtFS.
+ *
+ * VirtFS is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * VirtFS is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with VirtFS.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
+#define _GNU_SOURCE
+#define FUSE_USE_VERSION 30
+
+#ifdef HAVE_CONFIG_H
+# include <config.h>
+#endif
+
+#include <fuse_lowlevel.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <assert.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <sys/mount.h>
-#include <mntent.h>
-#include <pwd.h>
-#include <libgen.h>
-#include <getopt.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <errno.h>
 
-#include "log.h"
-#include "hsfs.h"
-#include "hsx_fuse.h"
-#include "config.h"
-#include "xcommon.h"
-#include "mount_constants.h"
-#include "fstab.h"
-#include "nfs_mntent.h"
-
-int __INIT_DEBUG = 0;
-
-char *progname = NULL;
-int verbose = 0;
-int nomtab = 0;
-int fg = 0;
-
-static struct option hsfs_opts[] = {
-	{ "foreground", 0, 0, 'f' },
-	{ "help", 0, 0, 'h' },
-	{ "no-mtab", 0, 0, 'n' },
-	{ "read-only", 0, 0, 'r' },
-	{ "ro", 0, 0, 'r' },
-	{ "read-write", 0, 0, 'w' },
-	{ "rw", 0, 0, 'w' },
-	{ "verbose", 0, 0, 'v' },
-	{ "version", 0, 0, 'V' },
-	{ "options", 1, 0, 'o' },
-	{ NULL, 0, 0, 0 }
+/*
+ * This file is the fuse filesystem implementation of VirtFS, by some
+ * historic reasons, it was named as "HSFS". The "hsfs_" prefix is
+ * kept as a shortcut for "virtfs_fuse_", to avoid conflicts with
+ * VirtFS library naming ("virtfs_").
+ */
+struct hsfs_cmdline_opts {
+        char *mountspec;
+        char *netid;
 };
 
-static void print_usage(void)
+/* VirtFS fuse super */
+struct hsfs_super {
+        struct hsfs_cmdline_opts opts;
+        int flags;
+        struct fuse_conn_info *conn;
+        int bufsize;
+        int sock;
+};
+
+/* For flags */
+#define HSFS_SB_VIRTFS 0x0001
+
+/* Debug */
+#ifndef unlikely
+# define unlikely(x)	__builtin_expect((x),0)
+#endif	/* unlikely */
+int __INIT_DEBUG = 0;
+#define DEBUG(fmt, args...) do {                                        \
+                if (unlikely(__INIT_DEBUG))                             \
+                        fprintf(stderr, fmt "\n", ##args);              \
+        }while(0)
+#define DUMP_FUSE_CONN(c) do {                                          \
+                DEBUG("Fuse conn(%p), Kernel_VER(%d.%d) FUSE_VER(%d, %d)", c, \
+                      (c)->proto_major, (c)->proto_minor,               \
+                      FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);          \
+        }while(0)
+#define DUMP_HSFS_OPTS(o) do {                                          \
+                DEBUG("HSFS Opt mountspec: %s", (o)->mountspec);        \
+                DEBUG("HSFS Opt netid: %s", (o)->netid);                \
+        }while(0)
+#define DUMP_HSFS_SUPER(s) do {                                         \
+                DEBUG("HSFS Super(%p), flags(0x%x)", s, (s)->flags);    \
+                DUMP_HSFS_OPTS(&(s->opts));                             \
+        }while(0)
+#define BUG_ON(exp) assert(!(exp))
+
+char *progname = NULL;
+
+#define FUSE_URI_SCHEME "fuse://"
+#define FUSE_URI_SCHEME_LEN 7
+
+#define KERNEL_BUF_PAGES 32
+#define HEADER_SIZE 0x1000
+
+static void exit_usage(int err)
 {
 	printf("usage: %s remotetarget dir [-rvVwfnh] [-t version] [-o hsfsoptions]\n", progname);
 	printf("options:\n\t-r\t\tMount file system readonly\n");
@@ -55,7 +105,7 @@ static void print_usage(void)
 	printf("\thsfsoptions\tRefer mount.hsfs(8) or hsfs(5)\n\n");
         fuse_cmdline_help();
         fuse_lowlevel_help();
-	exit(0);
+	exit(err);
 }
 
 static void print_version(void)
@@ -78,13 +128,23 @@ static inline int hsi_fuse_add_opt(struct fuse_args *args, const char *opt)
 	return fuse_opt_add_opt(opts, opt);
 }
 
-static struct fuse_lowlevel_ops hsfs_raw_ops = {
-        .init = hsx_fuse_init,
-};
 
-#ifdef BUILD_NFS3
+static void hsfs_fuse_init(void *userdata, struct fuse_conn_info *conn)
+{
+	struct hsfs_super *sb = (struct hsfs_super *)userdata;
+
+        BUG_ON(sb->conn);
+        sb->conn = conn;
+
+        DUMP_FUSE_CONN(conn);
+        DUMP_HSFS_SUPER(sb);
+
+        /* There is no way to return any errors during init. */
+}
+
 static struct fuse_lowlevel_ops hsfs_oper = {
-	.init = hsx_fuse_init,
+        .init = hsfs_fuse_init,
+#ifdef BUILD_VIRTFS
 	.getattr = hsx_fuse_getattr,
 	.statfs = hsx_fuse_statfs,
 	.lookup = hsx_fuse_lookup,
@@ -108,372 +168,184 @@ static struct fuse_lowlevel_ops hsfs_oper = {
 	.access = hsx_fuse_access,
 	.getxattr = hsx_fuse_getxattr,
 	.setxattr = hsx_fuse_setxattr,
-#if FUSE_VERSION >= 30
 	.readdirplus = hsx_fuse_readdir_plus,
 #endif
 };
-#endif
 
-/*
- * Map from -o and fstab option strings to the flag argument to mount(2).
- */
-struct opt_map {
-	const char *nfs_opt;	/* option name */
-	int skip;		/* skip in mtab option string */
-	int inv;		/* true if flag value should be inverted */
-	int mask;		/* flag mask value */
-	const char *fuse_opt;	/* for fuse args mapping */
+
+static const struct fuse_opt hsfs_cmdline_spec[] = {
+        {"proto=%s", offsetof(struct hsfs_cmdline_opts, netid), 0},
+        FUSE_OPT_END
 };
 
-/* Custom mount options for our own purposes.  */
-/* Maybe these should now be freed for kernel use again */
-#define MS_DUMMY	0x00000000
-#define MS_USERS	0x40000000
-#define MS_USER		0x20000000
 
-static const struct opt_map opt_map[] = {
-  { "defaults", 0, 0, 0              , NULL      },    /* default options */
-  { "ro",       1, 0, MS_RDONLY      , "ro"      },    /* read-only */
-  { "rw",       1, 1, MS_RDONLY      , "rw"      },    /* read-write */
-  { "exec",     0, 1, MS_NOEXEC      , "exec"    },    /* permit execution of binaries */
-  { "noexec",   0, 0, MS_NOEXEC      , "noexec"  },    /* don't execute binaries */
-  { "suid",     0, 1, MS_NOSUID      , "suid"    },    /* honor suid executables */
-  { "nosuid",   0, 0, MS_NOSUID      , "nosuid"  },    /* don't honor suid executables */
-  { "dev",      0, 1, MS_NODEV       , "dev"     },    /* interpret device files  */
-  { "nodev",    0, 0, MS_NODEV       , "nodev"   },    /* don't interpret devices */
-  { "sync",     0, 0, MS_SYNCHRONOUS , "sync"    },    /* synchronous I/O */
-  { "async",    0, 1, MS_SYNCHRONOUS , "async"   },    /* asynchronous I/O */
-  { "dirsync",  0, 0, MS_DIRSYNC     , "dirsync" },    /* synchronous directory modifications */
-  { "remount",  0, 0, MS_REMOUNT     , NULL      },    /* Alter flags of mounted FS */
-  { "bind",     0, 0, MS_BIND        , NULL      },    /* Remount part of tree elsewhere */
-  { "rbind",    0, 0, MS_BIND|MS_REC , NULL      },    /* Idem, plus mounted subtrees */
-  { "auto",     0, 0, MS_DUMMY       , NULL      },    /* Can be mounted using -a */
-  { "noauto",   0, 0, MS_DUMMY       , NULL      },    /* Can  only be mounted explicitly */
-  { "users",    0, 0, MS_USERS       , "allow_other" },/* Allow ordinary user to mount */
-  { "nousers",  0, 1, MS_USERS       , "allow_root"  },/* Forbid ordinary user to mount */
-  { "user",     0, 0, MS_USER        , "allow_other" },/* Allow ordinary user to mount */
-  { "nouser",   0, 1, MS_USER        , "allow_root"  },/* Forbid ordinary user to mount */
-  { "owner",    0, 0, MS_DUMMY       , NULL      },    /* Let the owner of the device mount */
-  { "noowner",  0, 0, MS_DUMMY       , NULL      },    /* Device owner has no special privs */
-  { "group",    0, 0, MS_DUMMY       , NULL      },    /* Let the group of the device mount */
-  { "nogroup",  0, 0, MS_DUMMY       , NULL      },    /* Device group has no special privs */
-  { "_netdev",  0, 0, MS_DUMMY       , NULL      },    /* Device requires network */
-  { "comment",  0, 0, MS_DUMMY       , NULL      },    /* fstab comment only (kudzu,_netdev)*/
+static int hsfs_cmdline_proc(void *data, const char *arg, int key,
+                             struct fuse_args *outargs)
+{
+        struct hsfs_cmdline_opts *opts = data;
 
-  /* add new options here */
-#ifdef MS_NOSUB
-  { "sub",      0, 1, MS_NOSUB       , NULL      },    /* allow submounts */
-  { "nosub",    0, 0, MS_NOSUB       , NULL      },    /* don't allow submounts */
+        switch (key) {
+        case FUSE_OPT_KEY_NONOPT:
+                if (!opts->mountspec)
+                        return fuse_opt_add_opt(&opts->mountspec, arg);
+                else
+                        return 1;
+        default:
+                return 1;
+        }
+
+        return 0;
+}
+
+static int hsfs_parse_cmdline(struct fuse_args *args,
+                              struct fuse_cmdline_opts *fuse_opts,
+                              struct hsfs_cmdline_opts *hsfs_opts)
+{
+        int ret;
+
+        ret = fuse_opt_parse(args, hsfs_opts, hsfs_cmdline_spec, hsfs_cmdline_proc);
+        if (ret != 0)
+                goto out_usage;
+
+        ret = fuse_parse_cmdline(args, fuse_opts);
+
+        if (ret != 0)
+                goto out_usage;
+
+        if (fuse_opts->show_help)
+                goto out_usage;
+        else if (fuse_opts->show_version) {
+                print_version();
+                goto out;
+        }
+
+        __INIT_DEBUG = fuse_opts->debug;
+
+#ifndef BUILD_VIRTFS
+        ret = strncmp(hsfs_opts->mountspec, FUSE_URI_SCHEME,
+                      FUSE_URI_SCHEME_LEN);
+        if (ret != 0){
+                printf("Only " FUSE_URI_SCHEME " is supported.\n");
+                goto out;
+        }
 #endif
-#ifdef MS_SILENT
-  { "quiet",    0, 0, MS_SILENT      , NULL      },    /* be quiet  */
-  { "loud",     0, 1, MS_SILENT      , NULL      },    /* print out messages. */
-#endif
-#ifdef MS_MANDLOCK
-  { "mand",     0, 0, MS_MANDLOCK    , NULL      },    /* Allow mandatory locks on this FS */
-  { "nomand",   0, 1, MS_MANDLOCK    , NULL      },    /* Forbid mandatory locks on this FS */
-#endif
-  { "loop",     1, 0, MS_DUMMY       , NULL      },    /* use a loop device */
-#ifdef MS_NOATIME
-  { "atime",    0, 1, MS_NOATIME     , "atime"   },     /* Update access time */
-  { "noatime",  0, 0, MS_NOATIME     , "noatime" },     /* Do not update access time */
-#endif
-#ifdef MS_NODIRATIME
-  { "diratime", 0, 1, MS_NODIRATIME  , NULL      },  /* Update dir access times */
-  { "nodiratime", 0, 0, MS_NODIRATIME, NULL      },/* Do not update dir access times */
-#endif
-  { NULL,	0, 0, 0, NULL	}
-};
 
-/* Try to build a canonical options string.  */
-static char * hsi_fix_opts_string (int flags, const char *extra_opts) {
-	const struct opt_map *om;
-	char *new_opts;
+        return 0;
 
-	new_opts = xstrdup((flags & MS_RDONLY) ? "ro" : "rw");
-	if (flags & MS_USER) {
-		struct passwd *pw = getpwuid(getuid());
-		if(pw)
-			new_opts = xstrconcat3(new_opts, ",user=", pw->pw_name);
-	}
-	
-	for (om = opt_map; om->nfs_opt != NULL; om++) {
-		if (om->skip)
-			continue;
-		if (om->inv || !om->mask || (flags & om->mask) != om->mask)
-			continue;
-		new_opts = xstrconcat3(new_opts, ",", om->nfs_opt);
-		flags &= ~om->mask;
-	}
-	if (extra_opts && *extra_opts) {
-		new_opts = xstrconcat3(new_opts, ",", extra_opts);
-	}
-
-	return new_opts;
-}
-
-static inline void dup_mntent(struct mntent *ment, nfs_mntent_t *nment)
-{
-	/* Not sure why nfs_mntent_t should exist */
-	nment->mnt_fsname = strdup(ment->mnt_fsname);
-	nment->mnt_dir = strdup(ment->mnt_dir);
-	nment->mnt_type = strdup(ment->mnt_type);
-	nment->mnt_opts = strdup(ment->mnt_opts);
-	nment->mnt_freq = ment->mnt_freq;
-	nment->mnt_passno = ment->mnt_passno;
-}
-static inline void free_mntent(nfs_mntent_t *ment, int remount)
-{
-	free(ment->mnt_fsname);
-	free(ment->mnt_dir);
-	free(ment->mnt_type);
-	/* 
-	 * Note: free(ment->mnt_opts) happens in discard_mntentchn()
-	 * via update_mtab() on remouts
-	 */
-	 if (!remount)
-	 	free(ment->mnt_opts);
-}
-
-static int hsi_add_mtab(const char *spec, const char *mount_point,
-				char *fstype, int flags, char *opts)
-{
-	struct mntent ment;
-	FILE *mtab;
-	int res = 1;
-
-	if (nomtab)
-		return 0;
-
-	ment.mnt_fsname = (char *)spec;
-	ment.mnt_dir = (char *)mount_point;
-	ment.mnt_type = fstype;
-	ment.mnt_opts = hsi_fix_opts_string(flags, opts);
-	ment.mnt_freq = 0;
-	ment.mnt_passno= 0;
-
-	if(flags & MS_REMOUNT) {
-		nfs_mntent_t nment;
-		
-		dup_mntent(&ment, &nment);
-		update_mtab(nment.mnt_dir, &nment);
-		free_mntent(&nment, 1);
-		return 0;
-	}
-
-	lock_mtab();
-
-	if ((mtab = setmntent(MOUNTED, "a+")) == NULL) {
-		ERR("Can't open " MOUNTED);
-		goto end;
-	}
-
-	if (addmntent(mtab, &ment) == 1) {
-		ERR("Can't write mount entry");
-		goto end;
-	}
-
-	endmntent(mtab);
-	res = 0;
-end:
-	unlock_mtab();
-	return res;
-}
-
-static int hsi_del_mtab(const char *node)
-{
-	if (nomtab)
-		return 0;
-
-	update_mtab (node, NULL);
-
-	return 0;
-}
-
-static void hsi_parse_opt(const char *opt, int *flags, struct fuse_args *args,
-					char *extra_opts, size_t len)
-{
-	const struct opt_map *om = NULL;
-
-	for (om = opt_map; om->nfs_opt != NULL; om++) {
-		if (!strcmp (opt, om->nfs_opt)) {
-			if (om->fuse_opt) {
-				hsi_fuse_add_opt(args, om->fuse_opt);
-				if (om->inv)
-					*flags &= ~om->mask;
-				else
-					*flags |= om->mask;
-			} else {
-				WARNING("Not supported opt: %s.", opt);
-			}
-			return;
-		} else {
-			hsi_fuse_add_opt(args, opt);
-			return;
-		}
-	}
-
-	len -= strlen(extra_opts);
-
-	if (*extra_opts && --len > 0)
-		strcat(extra_opts, ",");
-
-	if ((len -= strlen(opt)) > 0)
-		strcat(extra_opts, opt);
-}
-
-
-static void hsi_parse_opts(const char *options, int *flags, 
-				struct fuse_args *args, char **udata)
-{
-	if (options != NULL) {
-		char *opts = xstrdup(options);
-		char *opt = NULL, *p = NULL;
-		size_t len = strlen(opts) + 1;	/* include room for a null */
-		int open_quote = 0;
-
-		*udata = xmalloc(len);
-		**udata = '\0';
-
-		for (p = opts, opt = NULL; p && *p; p++) {
-			if (!opt)
-				opt = p;	/* begin of the option item */
-			if (*p == '"')
-				open_quote ^= 1; /* reverse the status */
-			if (open_quote)
-				continue;	/* still in a quoted block */
-			if (*p == ',')
-				*p = '\0';	/* terminate the option item */
-
-			/* end of option item or last item */
-			if (*p == '\0' || *(p + 1) == '\0') {
-				hsi_parse_opt(opt, flags, args, *udata, len);
-				opt = NULL;
-			}
-		}
-		free(opts);
-	}
-}
-
-static int hsi_parse_cmdline(int argc, char **argv, int *flags, 
-				struct fuse_args *args, char **udata)
-{
-	char *tdata = NULL;
-	int c = 0, ret = 0;
-
-	while((c = getopt_long(argc, argv, "rvVwfno:h",
-			        hsfs_opts, NULL)) != -1) {
-		switch(c) {
-		case 'r':
-			*flags |= MS_RDONLY;
-			break;
-		case 'v':
-			++verbose;
-			break;
-		case 'w':
-			*flags &= ~MS_RDONLY;
-			break;
-		case 'f':
-			fg = 1;
-			break;
-		case 'n':
-			nomtab = 1;
-			break;
-		case 'o':
-			tdata = optarg;
-			break;
-		case 'h':
-		default:
-			print_usage();
-			break;
-			
-		}
-	}
-
-	if (optind != argc)
-		print_usage();
-
-	/* add subtype args */
-	{
-		char subtype_opt[4096] = {};
-
-		sprintf(subtype_opt, "-osubtype=%s", progname);
-		ret = fuse_opt_add_arg(args, subtype_opt);
-		if (ret)
-			goto out;
-	}
-
-	/* add fs mode */
-	{
-		char *opt = NULL;
-		opt = (*flags) & MS_RDONLY ? "ro" : "rw";
-		ret = hsi_fuse_add_opt(args, opt);
-		if (ret)
-			goto out;
-	}
-
-	hsi_parse_opts(tdata, flags, args, udata);
-
-	ret = fuse_daemonize(fg);
+out_usage:
+        exit_usage(ret);
+        /* Never reach here... */
 out:
 	return ret;
 }
 
+int hsfs_redirect_loop(struct fuse_session *se, struct hsfs_super *sb)
+{
+        int err, res = 0;
+        int fuse_fd = fuse_session_fd(se);
+
+        struct fuse_buf fbuf = {
+                .mem = NULL,
+        };
+
+        while (!fuse_session_exited(se)) {
+                res = fuse_session_receive_buf(se, &fbuf);
+
+                if (res == -EINTR)
+                        continue;
+                if (res <= 0)
+                        break;
+
+                BUG_ON(fbuf.mem == NULL);
+
+                err = send(sb->sock, fbuf.mem, res, 0);
+                if (err != res)
+                        break;
+
+                // err = recv(sb->sock, &header, sizeof(header), 0);
+                if (err != res)
+                        break;
+
+                fuse_session_process_buf(se, &fbuf);
+        }
+
+        free(fbuf.mem);
+
+        /* XXX: No exported API to handle the error */
+        /* if(se->error != 0) */
+        /*         res = se->error; */
+        fuse_session_reset(se);
+        return res;
+}
+
+int hsfs_fill_super(struct hsfs_super *sb, struct fuse_cmdline_opts *fuse_opts)
+{
+        struct hsfs_cmdline_opts *hsfs_opts = &(sb->opts);
+        struct sockaddr_un addr_serv;
+        int err = 0;
+
+        DUMP_HSFS_SUPER(sb);
+
+        sb->bufsize = KERNEL_BUF_PAGES * getpagesize() + HEADER_SIZE;
+
+        sb->sock = socket(PF_UNIX, SOCK_STREAM, 0);
+        if (sb->sock < 0){
+                err = errno;
+                perror(progname);
+                goto out;
+        }
+
+        memset(&addr_serv, 0, sizeof(addr_serv));
+        addr_serv.sun_family = AF_UNIX;
+        strncpy(addr_serv.sun_path, hsfs_opts->mountspec + FUSE_URI_SCHEME_LEN, 108);
+
+        err = connect(sb->sock, (struct sockaddr *)&addr_serv, sizeof(addr_serv));
+        if (err){
+                err = errno;
+                perror(progname);
+                goto out1;
+        }
+
+        return 0;
+
+out1:
+        close(sb->sock);
+out:
+        return err;
+}
+
+void hsfs_destroy_super(struct hsfs_super *sb)
+{
+        DUMP_HSFS_SUPER(sb);
+}
+
 int main(int argc, char **argv)
 {
-	struct fuse_args args;
+        struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
         struct fuse_cmdline_opts opts;
 	struct fuse_session *se = NULL;
-	char *mountpoint = NULL, *mountspec = NULL, *udata = NULL;
 	struct hsfs_super super;
 	int err = -1;
 
-	bzero(&args, sizeof(struct fuse_args));
+        /* struct hsfs_super contains struct hsfs_cmdline_opts, zero
+         * it before parse cmdline option. */
 	bzero(&super, sizeof(struct hsfs_super));
 
 	progname = basename(argv[0]);
 
 	if (argc < 3)
-		print_usage();
+		exit_usage(1);
 
-	mountspec = argv[1];
-	mountpoint = argv[2];
-
-	argv[2] = argv[0]; /* so that getopt error messages are correct */
-	err = hsi_parse_cmdline(argc - 2, argv + 2, &super.flags,
-				&args, &udata);
+        /* It actually never returns on errors. */
+        err = hsfs_parse_cmdline(&args, &opts, &super.opts);
 	if (err != 0)
 		goto out;
 
-        if (fuse_parse_cmdline(&args, &opts) != 0) {
-                print_usage();
-                goto out;
-        }
-
-        if (opts.show_help) {
-                print_usage();
-                err = 0;
-                goto err_out1;
-        }
-        else if (opts.show_version) {
-                print_version();
-                err = 0;
-                goto err_out1;
-        }
-#if 0
-	err = hsfs_init();
+        err = hsfs_fill_super(&super, &opts);
 	if (err)
 		goto out;
 
-	ch = hsx_fuse_mount(mountspec, mountpoint, &args, udata, &super);
-	if (ch == NULL)
-		goto out;
-#endif
-	if (getuid() == 0)
-		hsi_add_mtab(mountspec, mountpoint, HSFS_TYPE, super.flags,
-			 udata);
-
-        se = fuse_session_new(&args, &hsfs_raw_ops, sizeof(hsfs_raw_ops), &super);
+        se = fuse_session_new(&args, &hsfs_oper, sizeof(hsfs_oper), &super);
         if (se == NULL)
                 goto err_out1;
 
@@ -485,13 +357,12 @@ int main(int argc, char **argv)
 
         fuse_daemonize(opts.foreground);
 
-        if (opts.singlethread)
+        if (!(super.flags & HSFS_SB_VIRTFS))
+                err = hsfs_redirect_loop(se, &super);
+        else if (opts.singlethread)
 			err = fuse_session_loop(se);
         else
                 err = fuse_session_loop_mt(se, opts.clone_fd);
-	
-	if (getuid() == 0)
-		hsi_del_mtab(mountpoint);
 
 	fuse_session_unmount(se);
 err_out3:
@@ -499,11 +370,10 @@ err_out3:
 err_out2:
         fuse_session_destroy(se);
 err_out1:
-        free(opts.mountpoint);
+        hsfs_destroy_super(&super);
 out:
-	if (udata)
-		free(udata);
-
+        if (opts.mountpoint != NULL)
+                free(opts.mountpoint);
 	fuse_opt_free_args(&args);
 
 	return err ? 1 : 0;
