@@ -63,7 +63,7 @@ FUSE submodule broken ("git submodule update --init fuse" required?)]),
 AM_CONDITIONAL([BUILD_FUSE], [test x"$with_system_fuse" != xyes])
 AM_CONDITIONAL([BUILD_NFS3], [test x"$with_nfs3" == xyes])
 
-AC_CHECK_LIB([tirpc], [clnt_tp_create], [], AC_MSG_ERROR([You need libtirpc to run.]))
+# AC_CHECK_LIB([tirpc], [clnt_tp_create], [], AC_MSG_ERROR([You need libtirpc to run.]))
 
 # Checks for header files.
 AC_HEADER_ASSERT

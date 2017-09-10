@@ -81,6 +81,9 @@ int __INIT_DEBUG = 0;
                 DEBUG("HSFS Super(%p), flags(0x%x)", s, (s)->flags);    \
                 DUMP_HSFS_OPTS(&(s->opts));                             \
         }while(0)
+#define DUMP_FUSE_OPT(o) do {                                           \
+                DEBUG("fuse_cmdline_opts: single thread(%d)", (o)->singlethread); \
+        }while(0)
 #define BUG_ON(exp) assert(!(exp))
 
 char *progname = NULL;
@@ -115,19 +118,6 @@ static void print_version(void)
         fuse_lowlevel_version();
 	exit(0);
 }
-
-static inline int hsi_fuse_add_opt(struct fuse_args *args, const char *opt)
-{
-	char **opts = NULL;
-
-	if (args == NULL)
-		return EINVAL;
-	
-	opts = args->argv + (args->argc -1);
-	
-	return fuse_opt_add_opt(opts, opt);
-}
-
 
 static void hsfs_fuse_init(void *userdata, struct fuse_conn_info *conn)
 {
@@ -180,7 +170,7 @@ static const struct fuse_opt hsfs_cmdline_spec[] = {
 
 
 static int hsfs_cmdline_proc(void *data, const char *arg, int key,
-                             struct fuse_args *outargs)
+                             struct fuse_args *outargs __attribute__((unused)))
 {
         struct hsfs_cmdline_opts *opts = data;
 
@@ -241,41 +231,42 @@ out:
 
 int hsfs_redirect_loop(struct fuse_session *se, struct hsfs_super *sb)
 {
-        int err, res = 0;
+        int err = 0;
         int fuse_fd = fuse_session_fd(se);
-
+        /* XXX Should poll it！ */
         struct fuse_buf fbuf = {
                 .mem = NULL,
         };
 
         while (!fuse_session_exited(se)) {
-                res = fuse_session_receive_buf(se, &fbuf);
+                int res = fuse_session_receive_buf(se, &fbuf);
 
                 if (res == -EINTR)
                         continue;
                 if (res <= 0)
                         break;
 
-                BUG_ON(fbuf.mem == NULL);
+                if (fbuf.flags == FUSE_BUF_IS_FD)
+                        err = splice(fbuf.fd, NULL, sb->sock, NULL, res, 0);
+                else if (fbuf.flags == 0)
+                        err = send(sb->sock, fbuf.mem, res, 0);
+                else
+                        BUG_ON(fbuf.flags);
 
-                err = send(sb->sock, fbuf.mem, res, 0);
-                if (err != res)
+                if (err != res){
+                        err = errno;
                         break;
-
-                // err = recv(sb->sock, &header, sizeof(header), 0);
-                if (err != res)
-                        break;
-
-                fuse_session_process_buf(se, &fbuf);
+                }
         }
 
-        free(fbuf.mem);
+        if (fbuf.mem)
+                free(fbuf.mem);
 
         /* XXX: No exported API to handle the error */
         /* if(se->error != 0) */
         /*         res = se->error; */
         fuse_session_reset(se);
-        return res;
+        return err;
 }
 
 int hsfs_fill_super(struct hsfs_super *sb, struct fuse_cmdline_opts *fuse_opts)
@@ -285,6 +276,7 @@ int hsfs_fill_super(struct hsfs_super *sb, struct fuse_cmdline_opts *fuse_opts)
         int err = 0;
 
         DUMP_HSFS_SUPER(sb);
+        DUMP_FUSE_OPT(fuse_opts);
 
         sb->bufsize = KERNEL_BUF_PAGES * getpagesize() + HEADER_SIZE;
 
