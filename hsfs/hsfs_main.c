@@ -47,6 +47,17 @@ struct hsfs_cmdline_opts {
         char *netid;
 };
 
+struct hsfs_remote_info {
+        uint32_t	major;
+	uint32_t	minor;
+	uint32_t	max_readahead;
+	uint32_t	flags;
+	uint16_t	max_background;
+	uint16_t	congestion_threshold;
+	uint32_t	max_write;
+	uint32_t	time_gran;
+};
+
 /* VirtFS fuse super */
 struct hsfs_super {
         struct hsfs_cmdline_opts opts;
@@ -54,6 +65,7 @@ struct hsfs_super {
         struct fuse_conn_info *conn;
         int bufsize;
         int sock;
+        struct hsfs_remote_info remote;
 };
 
 /* For flags */
@@ -229,6 +241,182 @@ out:
 	return ret;
 }
 
+struct in_header {
+	uint32_t	len;
+	uint32_t	opcode;
+	uint64_t	unique;
+	uint64_t	nodeid;
+	uint32_t	uid;
+	uint32_t	gid;
+	uint32_t	pid;
+	uint32_t	padding;
+};
+
+struct out_header {
+	uint32_t	len;
+	int32_t		error;
+	uint64_t	unique;
+};
+
+struct init_out {
+	uint32_t	major;
+	uint32_t	minor;
+	uint32_t	max_readahead;
+	uint32_t	flags;
+	uint16_t	max_background;
+	uint16_t	congestion_threshold;
+	uint32_t	max_write;
+	uint32_t	time_gran;
+	uint32_t	unused[9];
+};
+
+#define __FUSE_INIT 26
+
+static int hsfs_do_recv(struct fuse_session *se, struct hsfs_super *sb,
+                        struct fuse_buf *recv_buf)
+{
+        struct fuse_bufvec src_vec, dst_vec = FUSE_BUFVEC_INIT(0);
+        struct out_header out;
+        int res, ret = 0;
+
+        if (fuse_session_exited(se))
+                goto out;
+
+	res = recv(sb->sock, &out, sizeof(out),  MSG_PEEK);
+        if (res < 0){
+                ret = errno;
+                goto out;
+        }
+        if (res != sizeof(out))
+                goto out;
+
+        DEBUG("   unique: %llu, error: %d, outsize: %d",
+              out.unique, out.error, out.len);
+
+        src_vec = FUSE_BUFVEC_INIT(out.len);
+        src_vec.buf[0].fd = sb->sock;
+        src_vec.buf[0].flags = FUSE_BUF_IS_FD;
+        if (recv_buf){
+                dst_vec.buf[0] = *recv_buf;
+        }
+        else{
+                dst_vec.buf[0].size = out.len;
+                dst_vec.buf[0].flags = FUSE_BUF_IS_FD;
+                dst_vec.buf[0].fd = fuse_session_fd(se);
+        }
+        res = fuse_buf_copy(&dst_vec, &src_vec, FUSE_BUF_NO_SPLICE);
+        DEBUG("  copy in: %d", res);
+        if (res < 0){
+                ret = res;
+                goto out;
+        }
+        if (res != (int)out.len){
+                ret = errno;
+                goto out;
+        }
+out:
+        return ret;
+}
+
+#define COPY(xx) do {                                                   \
+                sb->remote.xx = init_reply.reply.xx;                    \
+                DEBUG("Copy " #xx ":%d to super", (int)(sb->remote.xx)); \
+        } while(0)
+
+static int hsfs_process_init(struct fuse_session *se, struct hsfs_super *sb,
+                             struct fuse_buf *in_buf)
+{
+        struct init_reply {
+                struct out_header header;
+                struct init_out reply;
+        } init_reply;
+
+        struct fuse_buf outbuf = {
+                .size = sizeof(init_reply),
+                .mem = &init_reply,
+                .flags = 0,
+        };
+
+        int ret;
+
+        ret = hsfs_do_recv(se, sb, &outbuf);
+        if (ret < 0)
+                goto out;
+
+        COPY(major); COPY(minor); COPY(max_readahead); COPY(flags);
+        COPY(max_background); COPY(congestion_threshold); COPY(max_write);
+        COPY(time_gran);
+
+        fuse_session_process_buf(se, in_buf);
+out:
+        return ret;
+}
+
+/* Return value < 0 on error, 0 on exit*/
+#define HSFS_LOOP_NEXT 1
+#define HSFS_LOOP_RECV 2
+static int hsfs_do_send(struct fuse_session *se, struct hsfs_super *sb,
+                        struct fuse_buf *send_buf)
+{
+        struct fuse_bufvec dst_vec, src_vec = FUSE_BUFVEC_INIT(0);
+        int res, ret = 0;
+
+        if (send_buf == NULL)
+                send_buf = src_vec.buf;
+
+        if (fuse_session_exited(se))
+                goto out;
+
+        res = fuse_session_receive_buf(se, send_buf);
+        if (res == -EINTR) {
+                ret = HSFS_LOOP_NEXT;
+                goto out;
+        }
+        if (res < 0){
+                ret = res;
+                goto out;
+        }
+
+        dst_vec = FUSE_BUFVEC_INIT(res);
+        dst_vec.buf[0].flags  = FUSE_BUF_IS_FD | FUSE_BUF_FD_RETRY;
+        dst_vec.buf[0].fd = sb->sock;
+        if (send_buf != src_vec.buf)
+                src_vec.buf[0] = *send_buf;
+
+        ret = fuse_buf_copy(&dst_vec, &src_vec, 0);
+        if (ret <= 0)
+                goto out;
+        if (ret != res) {
+                ret = errno;
+                goto out;
+        }
+
+        ret = HSFS_LOOP_RECV;
+        if (!send_buf->flags) {
+                struct in_header *in = send_buf->mem;
+                DEBUG("unique: %llu, opcode: %d, nodeid: %llu, insize: %d, pid: %d",
+                      in->unique, in->opcode, in->nodeid, in->len, in->pid);
+
+                if (in->opcode == __FUSE_INIT){
+                        ret = hsfs_process_init(se, sb, send_buf);
+                        if (ret == 0)
+                                ret = HSFS_LOOP_NEXT;
+                        else
+                                goto out;
+                }
+        }
+        else {
+                DEBUG("unknown request in fd");
+        }
+
+out:
+        if ((send_buf == src_vec.buf) && (src_vec.buf[0].mem != NULL))
+                free(src_vec.buf[0].mem);
+
+        return ret;
+}
+
+
 int hsfs_redirect_loop(struct fuse_session *se, struct hsfs_super *sb)
 {
         int err = 0;
@@ -239,32 +427,20 @@ int hsfs_redirect_loop(struct fuse_session *se, struct hsfs_super *sb)
         };
 
         while (!fuse_session_exited(se)) {
-                int res = fuse_session_receive_buf(se, &fbuf);
-
-                if (res == -EINTR)
+                err = hsfs_do_send(se, sb, &fbuf);
+                if (err <= 0)
+                        break;
+                if (err == HSFS_LOOP_NEXT)
                         continue;
-                if (res <= 0)
-                        break;
 
-                if (fbuf.flags == FUSE_BUF_IS_FD)
-                        err = splice(fbuf.fd, NULL, sb->sock, NULL, res, 0);
-                else if (fbuf.flags == 0)
-                        err = send(sb->sock, fbuf.mem, res, 0);
-                else
-                        BUG_ON(fbuf.flags);
-
-                if (err != res){
-                        err = errno;
+                err = hsfs_do_recv(se, sb, NULL);
+                if (err < 0)
                         break;
-                }
         }
 
         if (fbuf.mem)
                 free(fbuf.mem);
 
-        /* XXX: No exported API to handle the error */
-        /* if(se->error != 0) */
-        /*         res = se->error; */
         fuse_session_reset(se);
         return err;
 }
