@@ -279,12 +279,15 @@ static int hsfs_do_recv(struct fuse_session *se, struct hsfs_super *sb,
         struct out_header out;
         int res, ret = 0;
 
+        BUG_ON(recv_buf == NULL);
+        BUG_ON(recv_buf->mem == NULL);
+
         if (fuse_session_exited(se))
                 goto out;
 
 	res = recv(sb->sock, &out, sizeof(out),  MSG_PEEK);
         if (res < 0){
-                ret = errno;
+                ret = -errno;
                 goto out;
         }
         if (res != sizeof(out))
@@ -295,25 +298,21 @@ static int hsfs_do_recv(struct fuse_session *se, struct hsfs_super *sb,
 
         src_vec = FUSE_BUFVEC_INIT(out.len);
         src_vec.buf[0].fd = sb->sock;
-        src_vec.buf[0].flags = FUSE_BUF_IS_FD;
-        if (recv_buf){
-                dst_vec.buf[0] = *recv_buf;
-        }
-        else{
-                dst_vec.buf[0].size = out.len;
-                dst_vec.buf[0].flags = FUSE_BUF_IS_FD;
-                dst_vec.buf[0].fd = fuse_session_fd(se);
-        }
+        src_vec.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_RETRY;
+        dst_vec.buf[0] = *recv_buf;
+        dst_vec.buf[0].size = out.len;
         res = fuse_buf_copy(&dst_vec, &src_vec, FUSE_BUF_NO_SPLICE);
-        DEBUG("  copy in: %d", res);
+        DEBUG("  xyz %d", res);
         if (res < 0){
                 ret = res;
                 goto out;
         }
         if (res != (int)out.len){
-                ret = errno;
+                ret = -errno;
                 goto out;
         }
+        recv_buf->size = res;
+        return 0;
 out:
         return ret;
 }
@@ -433,9 +432,16 @@ int hsfs_redirect_loop(struct fuse_session *se, struct hsfs_super *sb)
                 if (err == HSFS_LOOP_NEXT)
                         continue;
 
-                err = hsfs_do_recv(se, sb, NULL);
+                err = hsfs_do_recv(se, sb, &fbuf);
                 if (err < 0)
                         break;
+
+                err = write(fuse_fd, fbuf.mem, fbuf.size);
+                DEBUG("  copy in: %d, get %d", fbuf.size, err);
+                if (err < 0){
+                        err = -errno;
+                        break;
+                }
         }
 
         if (fbuf.mem)
