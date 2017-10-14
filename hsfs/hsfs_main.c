@@ -801,6 +801,8 @@ struct init_out {
 };
 
 #define __FUSE_INIT 26
+#define __FUSE_FORGET 2
+#define __FUSE_BATCH_FORGET 42
 
 static int hsfs_do_recv(struct fuse_session *se, struct hsfs_super *sb,
                         struct fuse_buf *recv_buf)
@@ -901,7 +903,7 @@ static int hsfs_do_send(struct fuse_session *se, struct hsfs_super *sb,
                 ret = HSFS_LOOP_NEXT;
                 goto out;
         }
-        if (res < 0){
+        if (res <= 0){
                 ret = res;
                 goto out;
         }
@@ -933,6 +935,9 @@ static int hsfs_do_send(struct fuse_session *se, struct hsfs_super *sb,
                         else
                                 goto out;
                 }
+                if ((in->opcode == __FUSE_BATCH_FORGET) ||
+                    (in->opcode == __FUSE_FORGET))
+                        ret = HSFS_LOOP_NEXT;
         }
         else {
                 DEBUG("unknown request in fd");
@@ -962,6 +967,7 @@ int hsfs_redirect_loop(struct fuse_session *se, struct hsfs_super *sb)
                 if (err == HSFS_LOOP_NEXT)
                         continue;
 
+                fbuf.flags = 0;
                 err = hsfs_do_recv(se, sb, &fbuf);
                 if (err < 0)
                         break;
