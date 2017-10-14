@@ -5,7 +5,7 @@ if BUILD_FUSE
   FUSE_FLAGS = -I../fuse/include -D_FILE_OFFSET_BITS=64
   FUSE_LIB = $(top_builddir)/fuse/lib/libfuse3.la
 else
-  FUSE_FLAGS = `pkg-config fuse --cflags`
+  FUSE_FLAGS = `pkg-config fuse3 --cflags`
 endif
 
 AM_CPPFLAGS = $(FUSE_FLAGS)

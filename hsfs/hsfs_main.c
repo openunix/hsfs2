@@ -590,25 +590,30 @@ char *progname = NULL;
 
 static void exit_usage(int err)
 {
-	printf("usage: %s remotetarget dir [-rvVwfnh] [-t version] [-o hsfsoptions]\n", progname);
+        printf("usage:\n");
+        printf("    %s [--client=URI|-o client=URI] [-d] [-f] [-s] [-o options] mount-point\n", progname);
+	printf("    %s [--server=URI|-o server=URI] [-d] [-f] [-s] [-o options] local-dir\n", progname);
+	printf("    %s [-h|--help] [-V|--version]\n", progname);
+        if (!err) {
+                printf("options:\n");
+                fuse_cmdline_help();
+                fuse_lowlevel_help();
+                printf("Refer to mount.%s(8) or %s(5) for more -o options and the URI spec.\n", progname, progname);
+        }
 	printf("options:\n\t-r\t\tMount file system readonly\n");
-	printf("\t-v\t\tVerbose\n");
-	printf("\t-V\t\tPrint version\n");
 	printf("\t-w\t\tMount file system read-write\n");
-	printf("\t-f\t\tForeground, not a daemon\n");
 	printf("\t-n\t\tDo not update /etc/mtab\n");
-	printf("\t-h\t\tPrint this help\n");
-	printf("\tversion\t\thsfs - currently, the only choice\n");
 	printf("\thsfsoptions\tRefer mount.hsfs(8) or hsfs(5)\n\n");
-        fuse_cmdline_help();
-        fuse_lowlevel_help();
-	exit(err);
+	exit(!!err);
 }
 
 static void print_version(void)
 {
-	printf("%s.\n", PACKAGE_STRING);
-        printf("FUSE library version %s\n", fuse_pkgversion());
+#ifdef PACKAGE_NAME
+	printf("%s version %s\n", PACKAGE_NAME, PACKAGE_VERSION);
+#else
+        printf("%s develop version\n", progname);
+#endif
         fuse_lowlevel_version();
 	exit(0);
 }
@@ -685,7 +690,7 @@ static int hsfs_cmdline_proc(void *data, const char *arg, int key,
 
         switch (key) {
         case FUSE_OPT_KEY_NONOPT:
-                if (!opts->client_spec)
+                if (!opts->client_spec && !opts->server_spec)
                         return fuse_opt_add_opt(&opts->client_spec, arg);
                 else
                         return 1;
@@ -712,36 +717,48 @@ static int hsfs_parse_cmdline(struct fuse_args *args,
         if (ret != 0)
                 goto out_usage;
 
+        __INIT_DEBUG = fuse_opts->debug;
+
         if (fuse_opts->show_help)
                 goto out_usage;
         else if (fuse_opts->show_version) {
                 print_version();
                 goto out;
         }
-
+        DUMP_HSFS_OPTS(hsfs_opts);
+        ret = 1;
         if (hsfs_opts->client_spec && hsfs_opts->server_spec) {
-                ret = 1;
-                fprintf(stderr, "client and server target can't be specified together.\n");
+                fprintf(stderr, "Client and server target URI cannot be specified together.\n");
                 goto out_usage;
         }
         else if (hsfs_opts->client_spec) {
                 hsfs_opts->target_spec = hsfs_opts->client_spec;
+                if (!fuse_opts->mountpoint) {
+                        fprintf(stderr, "The mount point must be specified for client mode.\n");
+                        goto out_usage;
+                }
         }
         else if (hsfs_opts->server_spec) {
                 hsfs_opts->target_spec = hsfs_opts->server_spec;
+                if (!fuse_opts->mountpoint) {
+                        fprintf(stderr, "The local serving dir must be specified for server mode.\n");
+                        goto out_usage;
+                }
                 hsfs_opts->server_path = fuse_opts->mountpoint;
         }
         else{
-                ret = 1;
-                fprintf(stderr, "either client or server target must be specified.\n");
+                fprintf(stderr, "Either client or server target URI must be specified.\n");
                 goto out_usage;
         }
 
-        __INIT_DEBUG = fuse_opts->debug;
-
         ret = strncmp(hsfs_opts->target_spec, "unix://", strlen("unix://"));
         if (ret != 0){
-                printf("Only unix:// is supported.\n");
+                printf("Only unix:// is supported as the target URI.\n");
+                goto out;
+        }
+        if (strlen(hsfs_opts->target_spec) <= strlen("unix://")){
+                ret = 1;
+                printf("Invalid unix domain socket URI: %s.\n", hsfs_opts->target_spec);
                 goto out;
         }
 
@@ -981,7 +998,8 @@ int hsfs_fill_super(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
         strncpy(addr_serv.sun_path, hsfs_opts->target_spec + 7,
                 sizeof(addr_serv.sun_path) - 1);
 
-        if (is_client(sb)){
+        if (hsfs_opts->client_spec){
+                sb->type = HSFS_SB_CLIENT;
                 sb->bufsize = KERNEL_BUF_PAGES * getpagesize() + HEADER_SIZE;
                 ret = connect(sb->sock, (struct sockaddr *)&addr_serv, sizeof(addr_serv));
                 if (ret){
@@ -993,6 +1011,7 @@ int hsfs_fill_super(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
         else {
                 struct lo_data *lo = &(sb->u.lo_data);
 
+                sb->type = HSFS_SB_SERVER;
                 lo->root.next = lo->root.prev = &(lo->root);
                 lo->debug = __INIT_DEBUG;
                 lo->root.fd = open(hsfs_opts->server_path, O_PATH);
@@ -1044,9 +1063,6 @@ int main(int argc, char **argv)
 
 	progname = basename(argv[0]);
 
-	if (argc < 3)
-		exit_usage(1);
-
         /* It actually never returns on errors. */
         err = hsfs_parse_cmdline(&args, &opts, &hsfs_opts);
 	if (err != 0)
@@ -1066,7 +1082,7 @@ int main(int argc, char **argv)
         if (is_client(&super))
                 err = fuse_session_mount(se, opts.mountpoint);
         else
-                err = fuse_session_bind(se, super.fd);
+                err = fuse_session_socket(se, super.fd);
         if (err)
                 goto err_out3;
 

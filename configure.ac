@@ -38,7 +38,7 @@ AC_ARG_WITH([system-fuse],
         [with_system_fuse=yes])
 AS_IF([test "x$with_system_fuse" == xyes],
         [AC_CHECK_LIB([fuse3], [fuse_session_new], [],
-                [no_fuse_lib=yes])]
+                [no_fuse_lib=yes])],
         [AS_IF([test -f "fuse/configure.ac"], [],
                 [no_fuse_lib=yes])])
 AS_IF([test "x$no_fuse_lib" == xyes],
@@ -53,12 +53,12 @@ if test "x$with_system_fuse" != "xyes"; then
         cd fuse && ./makeconf.sh
         [[ $? != 0 ]] && no_fuse_lib=yes
         cd $source_dir
-fi
-# Broken FUSE tree
-AS_IF([test "x$no_fuse_lib" == xyes],
-        AC_MSG_ERROR([
+        # Broken FUSE tree
+        AS_IF([test "x$no_fuse_lib" == xyes],
+               AC_MSG_ERROR([
 FUSE submodule broken ("git submodule update --init fuse" required?)]),
-        AC_CONFIG_SUBDIRS([fuse]))
+               AC_CONFIG_SUBDIRS([fuse]))
+fi
 
 AM_CONDITIONAL([BUILD_FUSE], [test x"$with_system_fuse" != xyes])
 AM_CONDITIONAL([BUILD_NFS3], [test x"$with_nfs3" == xyes])
