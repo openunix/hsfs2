@@ -517,7 +517,7 @@ struct hsfs_cmdline_opts {
         char *client_spec;
         char *server_spec;
         int writeback;
-        /* below are pointers only, never free */
+        /* below are reference only, never free */
         char *target_spec;
         char *server_path;
 };
@@ -542,7 +542,6 @@ struct hsfs_super {
         }u;
         int type;
         struct fuse_conn_info *conn;
-        int bufsize;
         int sock;
         int fd;
 };
@@ -566,27 +565,9 @@ int __INIT_DEBUG = 0;
                 if (unlikely(__INIT_DEBUG))                             \
                         fprintf(stderr, fmt "\n", ##args);              \
         }while(0)
-#define DUMP_FUSE_CONN(c) do {                                          \
-                DEBUG("Fuse conn(%p), Kernel_VER(%d.%d) FUSE_VER(%d, %d)", c, \
-                      (c)->proto_major, (c)->proto_minor,               \
-                      FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);          \
-        }while(0)
-#define DUMP_HSFS_OPTS(o) do {                                          \
-                DEBUG("HSFS Opt client_spec: %s", (o)->client_spec);    \
-                DEBUG("HSFS Opt server_spec: %s", (o)->server_spec);    \
-        }while(0)
-#define DUMP_HSFS_SUPER(s) do {                                         \
-                DEBUG("HSFS Super(%p), flags(0x%x)", s, (s)->type);    \
-        }while(0)
-#define DUMP_FUSE_OPT(o) do {                                           \
-                DEBUG("fuse_cmdline_opts: single thread(%d)", (o)->singlethread); \
-        }while(0)
 #define BUG_ON(exp) assert(!(exp))
 
 char *progname = NULL;
-
-#define KERNEL_BUF_PAGES 32
-#define HEADER_SIZE 0x1000
 
 static void exit_usage(int err)
 {
@@ -600,10 +581,6 @@ static void exit_usage(int err)
                 fuse_lowlevel_help();
                 printf("Refer to mount.%s(8) or %s(5) for more -o options and the URI spec.\n", progname, progname);
         }
-	printf("options:\n\t-r\t\tMount file system readonly\n");
-	printf("\t-w\t\tMount file system read-write\n");
-	printf("\t-n\t\tDo not update /etc/mtab\n");
-	printf("\thsfsoptions\tRefer mount.hsfs(8) or hsfs(5)\n\n");
 	exit(!!err);
 }
 
@@ -623,9 +600,6 @@ static void hsfs_init(void *userdata, struct fuse_conn_info *conn)
 	struct hsfs_super *sb = (struct hsfs_super *)userdata;
 
         BUG_ON(sb->conn);
-
-        DUMP_FUSE_CONN(conn);
-        DUMP_HSFS_SUPER(sb);
 
         /* There is no way to return any errors during init. */
         if (is_client(sb))
@@ -725,7 +699,6 @@ static int hsfs_parse_cmdline(struct fuse_args *args,
                 print_version();
                 goto out;
         }
-        DUMP_HSFS_OPTS(hsfs_opts);
         ret = 1;
         if (hsfs_opts->client_spec && hsfs_opts->server_spec) {
                 fprintf(stderr, "Client and server target URI cannot be specified together.\n");
@@ -834,7 +807,6 @@ static int hsfs_do_recv(struct fuse_session *se, struct hsfs_super *sb,
         dst_vec.buf[0] = *recv_buf;
         dst_vec.buf[0].size = out.len;
         res = fuse_buf_copy(&dst_vec, &src_vec, FUSE_BUF_NO_SPLICE);
-        DEBUG("  xyz %d", res);
         if (res < 0){
                 ret = res;
                 goto out;
@@ -940,7 +912,7 @@ static int hsfs_do_send(struct fuse_session *se, struct hsfs_super *sb,
                         ret = HSFS_LOOP_NEXT;
         }
         else {
-                DEBUG("unknown request in fd");
+                DEBUG("unknown request in pipe");
         }
 
 out:
@@ -973,7 +945,6 @@ int hsfs_redirect_loop(struct fuse_session *se, struct hsfs_super *sb)
                         break;
 
                 err = write(fuse_fd, fbuf.mem, fbuf.size);
-                DEBUG("  copy in: %d, get %d", fbuf.size, err);
                 if (err < 0){
                         err = -errno;
                         break;
@@ -1006,7 +977,6 @@ int hsfs_fill_super(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
 
         if (hsfs_opts->client_spec){
                 sb->type = HSFS_SB_CLIENT;
-                sb->bufsize = KERNEL_BUF_PAGES * getpagesize() + HEADER_SIZE;
                 ret = connect(sb->sock, (struct sockaddr *)&addr_serv, sizeof(addr_serv));
                 if (ret){
                         ret = errno;
@@ -1042,7 +1012,6 @@ int hsfs_fill_super(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
                 }
         }
 
-        DUMP_HSFS_SUPER(sb);
         return 0;
 
 out1:
@@ -1053,7 +1022,14 @@ out:
 
 void hsfs_destroy_super(struct hsfs_super *sb)
 {
-        DUMP_HSFS_SUPER(sb);
+        if (!is_client(sb)){
+                struct lo_data *lo = &(sb->u.lo_data);
+
+                while (lo->root.next != &(lo->root))
+                        lo_free(lo->root.next);
+                if (lo->root.fd >= 0)
+                        close(lo->root.fd);
+        }
 }
 
 int main(int argc, char **argv)
@@ -1112,6 +1088,10 @@ err_out1:
 out:
         if (opts.mountpoint != NULL)
                 free(opts.mountpoint);
+        if (hsfs_opts.client_spec)
+                free(hsfs_opts.client_spec);
+        if (hsfs_opts.server_spec)
+                free(hsfs_opts.server_spec);
 	fuse_opt_free_args(&args);
 
 	return err ? 1 : 0;
