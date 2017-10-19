@@ -63,7 +63,7 @@ fi
 AM_CONDITIONAL([BUILD_FUSE], [test x"$with_system_fuse" != xyes])
 AM_CONDITIONAL([BUILD_NFS3], [test x"$with_nfs3" == xyes])
 
-# AC_CHECK_LIB([tirpc], [clnt_tp_create], [], AC_MSG_ERROR([You need libtirpc to run.]))
+AC_CHECK_LIB([uriparser], [uriParseUriA], [], AC_MSG_ERROR([You need uriparser to run.]))
 
 # Checks for header files.
 AC_HEADER_ASSERT
@@ -108,6 +108,22 @@ if test "x$GCC" = "xyes" -o "x$CC" = "xclang" ; then
 else
   AC_DEFINE(_U_, , [Hint to the compiler that a function parameters is not used])
 fi
+
+
+
+AC_SUBST([VMWARE_FLAGS])
+AC_ARG_WITH([vmware-vmci],
+        [AS_HELP_STRING([[--with-vmware-vmci[=path]]], [build with VMware VMCI/VSOCK headers (default at /usr/lib/vmware/include).])],
+        [with_vmware_vmci=$withval],
+        [with_vmware_vmci=no])
+AS_IF([test "x$with_vmware_vmci" == xno],
+        [AC_CHECK_HEADERS([linux/vm_sockets.h], [],
+                [AC_MSG_ERROR([cannot find linux/vm_sockets.h, try use VMware VMCI/VSOCK headers with --with-vmware-vmci.])],
+                [#include <sys/socket.h>])],
+        [AS_IF([test "x$with_vmware_vmci" == xyes],
+                [VMWARE_FLAGS="-I/usr/lib/vmware/include -DWITH_VMWARE_VMCI"],
+                [VMWARE_FLAGS="-I$with_vmware_vmci -DWITH_VMWARE_VMCI"])])
+
 
 AC_CONFIG_FILES([Makefile
                  hsfs/Makefile

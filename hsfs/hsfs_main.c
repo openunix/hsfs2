@@ -512,14 +512,29 @@ static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <uriparser/Uri.h>
+
+#ifdef HAVE_LINUX_VM_SOCKETS_H
+#include <linux/vm_sockets.h>
+# ifndef AF_VSOCK
+#  define AF_VSOCK 40
+# endif
+# define HAVE_VSOCK
+#endif
+
+#ifdef WITH_VMWARE_VMCI
+# include <vmci/vmci_sockets.h>
+# define HAVE_VSOCK
+#endif
 
 struct hsfs_cmdline_opts {
-        char *client_spec;
-        char *server_spec;
+        int is_client;
+        int is_server;
         int writeback;
-        /* below are reference only, never free */
         char *target_spec;
+        /* below are reference only, never free */
         char *server_path;
+        UriUriA target_uri;
 };
 
 struct hsfs_remote_info {
@@ -544,6 +559,9 @@ struct hsfs_super {
         struct fuse_conn_info *conn;
         int sock;
         int fd;
+#ifdef WITH_VMWARE_VMCI
+        int vmci_fd;
+#endif  /* WITH_VMWARE_VMCI */
 };
 
 /* For type */
@@ -572,8 +590,8 @@ char *progname = NULL;
 static void exit_usage(int err)
 {
         printf("usage:\n");
-        printf("    %s [--client=URI|-o client=URI] [-d] [-f] [-s] [-o options] mount-point\n", progname);
-	printf("    %s [--server=URI|-o server=URI] [-d] [-f] [-s] [-o options] local-dir\n", progname);
+        printf("    %s --client URI [-d] [-f] [-s] [-o options] mount-point\n", progname);
+	printf("    %s --server URI [-d] [-f] [-s] [-o options] local-dir\n", progname);
 	printf("    %s [-h|--help] [-V|--version]\n", progname);
         if (!err) {
                 printf("options:\n");
@@ -642,14 +660,10 @@ static struct fuse_lowlevel_ops hsfs_oper = {
 
 
 static const struct fuse_opt hsfs_cmdline_spec[] = {
-        { "client=%s",
-          offsetof(struct hsfs_cmdline_opts, client_spec), 0},
-        { "--client=%s",
-          offsetof(struct hsfs_cmdline_opts, client_spec), 0},
-        { "server=%s",
-          offsetof(struct hsfs_cmdline_opts, server_spec), 0},
-        { "--server=%s",
-          offsetof(struct hsfs_cmdline_opts, server_spec), 0},
+        { "--client",
+          offsetof(struct hsfs_cmdline_opts, is_client), 1},
+        { "--server",
+          offsetof(struct hsfs_cmdline_opts, is_server), 1},
 	{ "writeback",
 	  offsetof(struct hsfs_cmdline_opts, writeback), 1 },
 	{ "no_writeback",
@@ -664,8 +678,8 @@ static int hsfs_cmdline_proc(void *data, const char *arg, int key,
 
         switch (key) {
         case FUSE_OPT_KEY_NONOPT:
-                if (!opts->client_spec && !opts->server_spec)
-                        return fuse_opt_add_opt(&opts->client_spec, arg);
+                if (!opts->target_spec)
+                        return fuse_opt_add_opt(&opts->target_spec, arg);
                 else
                         return 1;
         default:
@@ -680,6 +694,9 @@ static int hsfs_parse_cmdline(struct fuse_args *args,
                               struct hsfs_cmdline_opts *hsfs_opts)
 {
         int ret;
+        UriParserStateA state = {
+                .uri = &(hsfs_opts->target_uri),
+        };
 
 	bzero(hsfs_opts, sizeof(*hsfs_opts));
 
@@ -700,19 +717,17 @@ static int hsfs_parse_cmdline(struct fuse_args *args,
                 goto out;
         }
         ret = 1;
-        if (hsfs_opts->client_spec && hsfs_opts->server_spec) {
+        if (hsfs_opts->is_client && hsfs_opts->is_server) {
                 fprintf(stderr, "Client and server target URI cannot be specified together.\n");
                 goto out_usage;
         }
-        else if (hsfs_opts->client_spec) {
-                hsfs_opts->target_spec = hsfs_opts->client_spec;
+        else if (hsfs_opts->is_client) {
                 if (!fuse_opts->mountpoint) {
                         fprintf(stderr, "The mount point must be specified for client mode.\n");
                         goto out_usage;
                 }
         }
-        else if (hsfs_opts->server_spec) {
-                hsfs_opts->target_spec = hsfs_opts->server_spec;
+        else if (hsfs_opts->is_server) {
                 if (!fuse_opts->mountpoint) {
                         fprintf(stderr, "The local serving dir must be specified for server mode.\n");
                         goto out_usage;
@@ -724,15 +739,32 @@ static int hsfs_parse_cmdline(struct fuse_args *args,
                 goto out_usage;
         }
 
-        ret = strncmp(hsfs_opts->target_spec, "unix://", strlen("unix://"));
-        if (ret != 0){
-                printf("Only unix:// is supported as the target URI.\n");
-                goto out;
-        }
-        if (strlen(hsfs_opts->target_spec) <= strlen("unix://")){
+        if (uriParseUriA(&state, hsfs_opts->target_spec) != URI_SUCCESS)
                 ret = 1;
-                printf("Invalid unix domain socket URI: %s.\n", hsfs_opts->target_spec);
-                goto out;
+        else if (!hsfs_opts->target_uri.scheme.first) {
+                state.errorPos = hsfs_opts->target_spec;
+                ret = 1;
+        }
+        else if (strlen(hsfs_opts->target_uri.scheme.afterLast) <= 3) {
+                state.errorPos = hsfs_opts->target_uri.scheme.afterLast +
+                        strlen(hsfs_opts->target_uri.scheme.afterLast);
+                ret = 1;
+        }
+        else
+                ret = 0;
+        if (ret) {
+                fprintf(stderr, "%s: Incorrect URI format: %s\n", progname, hsfs_opts->target_spec);
+                if (state.errorPos){
+                        int i = state.errorPos - hsfs_opts->target_spec + strlen(progname) +
+                                sizeof(": Incorrect URI format: ") - 1;
+                        while (i > 0){
+                                fprintf(stderr, " ");
+                                i--;
+                        }
+                        fprintf(stderr, "^\n");
+                }
+                ret = 1;
+                goto out_usage;
         }
 
         return 0;
@@ -958,7 +990,7 @@ int hsfs_redirect_loop(struct fuse_session *se, struct hsfs_super *sb)
         return err;
 }
 
-int hsfs_fill_super(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
+int hsfs_start_unix_client(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
 {
         struct sockaddr_un addr_serv;
         int ret = 0;
@@ -975,16 +1007,37 @@ int hsfs_fill_super(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
         strncpy(addr_serv.sun_path, hsfs_opts->target_spec + 7,
                 sizeof(addr_serv.sun_path) - 1);
 
-        if (hsfs_opts->client_spec){
-                sb->type = HSFS_SB_CLIENT;
                 ret = connect(sb->sock, (struct sockaddr *)&addr_serv, sizeof(addr_serv));
                 if (ret){
                         ret = errno;
                         perror(progname);
                         goto out1;
                 }
+        return 0;
+out1:
+        close(sb->sock);
+out:
+        return ret;
+
+}
+
+int hsfs_start_unix_server(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
+{
+        struct sockaddr_un addr_serv;
+        int ret = 0;
+
+        sb->sock = socket(PF_UNIX, SOCK_STREAM, 0);
+        if (sb->sock < 0){
+                ret = errno;
+                perror(progname);
+                goto out;
         }
-        else {
+
+        memset(&addr_serv, 0, sizeof(addr_serv));
+        addr_serv.sun_family = AF_UNIX;
+        strncpy(addr_serv.sun_path, hsfs_opts->target_spec + 7,
+                sizeof(addr_serv.sun_path) - 1);
+
                 struct lo_data *lo = &(sb->u.lo_data);
 
                 sb->type = HSFS_SB_SERVER;
@@ -1010,12 +1063,165 @@ int hsfs_fill_super(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
                         perror("listen error");
                         goto out1;
                 }
-        }
 
         return 0;
 
 out1:
         close(sb->sock);
+out:
+        return ret;
+}
+
+static int __vmware_start
+
+int hsfs_start_vmci_client(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
+{
+        UriUriA *uri = &(hsfs_opts->target_uri);
+
+        if (!uri->hostText.first || !uri->portText.first){
+                fprintf(stderr, "%s: VMCI CID and port must be specified: %s",
+                        progname, hsfs_opts->target_spec);
+                goto err_out;
+        }
+
+        if (uri->userInfo.first || *uri->portText.afterLast != 0){
+                fprintf(stderr, "%s: Unsupported URI schema: %s\n",
+                        progname, hsfs_opts->target_spec);
+                goto err_out;
+        }
+
+        DEBUG("URI->hostText: %s, %d", uri->hostText.first, uri->hostText.afterLast - uri->hostText.first);
+        DEBUG("URI->portText: %s, %d", uri->portText.first, uri->portText.afterLast - uri->portText.first);
+
+err_out:
+        return 1;
+}
+
+int hsfs_start_vmci_server(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
+{
+        UriUriA *uri = &(hsfs_opts->target_uri);
+        int sockfd, connfd;
+        struct sockaddr_vm my_addr = {
+#ifdef WITH_VMWARE_VMCI
+                .svm_family = AF_UNSPEC,
+#else
+                .svm_family = AF_VSOCK,
+#endif
+        };
+
+#ifdef WITH_VMWARE_VMCI
+        unsigned int version;
+
+        version = VMCISock_Version();
+        if (version == VMCI_SOCKETS_INVALID_VERSION) {
+                perror("VMCI");
+                goto err_out;
+        }
+        DEBUG("VMCI: version=%d.%d.%d",
+              VMCI_SOCKETS_VERSION_EPOCH(version),
+              VMCI_SOCKETS_VERSION_MAJOR(version),
+              VMCI_SOCKETS_VERSION_MINOR(version));
+        my_addr.svm_family = VMCISock_GetAFValueFd(&(sb->vmci_fd));
+        if (my_addr.svm_family == -1){
+                perror("VSOCK");
+                goto err_out;
+        }
+        DEBUG("VMCI: address family at %d", my_addr.svm_family);
+#endif
+
+        if (!uri->hostText.first || !uri->portText.first){
+                fprintf(stderr, "%s: VMCI CID and port must be specified: %s\n",
+                        progname, hsfs_opts->target_spec);
+                goto err_out;
+        }
+        if (uri->userInfo.first || *uri->portText.afterLast != 0){
+                fprintf(stderr, "%s: Unsupported URI schema: %s\n",
+                        progname, hsfs_opts->target_spec);
+                goto err_out;
+        }
+        if (uri->hostText.first[0] == '*')
+                my_addr.svm_cid = VMADDR_CID_ANY;
+        else {
+                char *end = NULL;
+                long int l = strtol(uri->hostText.first, &end, 0);
+                if ((end != uri->hostText.afterLast) || l < 0
+                    || l >= -1U || l == LONG_MAX){
+                        fprintf(stderr, "%s: Invalid CID number: %s\n",
+                                progname, hsfs_opts->target_spec);
+                        goto err_out;
+                }
+                DEBUG("GET ICD %d\n", l);
+        }
+
+
+        sockfd = socket(AF_VSOCK, SOCK_DGRAM, 0);
+        if (sockfd == -1){
+                perror(progname);
+                goto err_out;
+        }
+
+
+        DEBUG("URI->hostText: %s, %d\n", uri->hostText.first, uri->hostText.afterLast - uri->hostText.first);
+        DEBUG("URI->portText: %s, %d\n", uri->portText.first, uri->portText.afterLast - uri->portText.first);
+err_out:
+        return 1;
+}
+
+struct hsfs_fs_type {
+        const char *name;
+        int (*fill_super)(struct hsfs_super *, struct hsfs_cmdline_opts *);
+        void (*kill_super)(struct hsfs_super *);
+} hsfs_fs_type_list [] = {
+        {
+                .name = "unix",
+                .fill_super = hsfs_start_unix_client,
+        },
+        {
+                .name = "vmci",
+                .fill_super = hsfs_start_vmci_client,
+        },
+        {
+                .name = "unix",
+                .fill_super = hsfs_start_unix_server,
+        },
+        {
+                .name = "vmci",
+                .fill_super = hsfs_start_vmci_server,
+        }
+};
+
+int hsfs_fill_super(struct hsfs_super *sb, struct hsfs_cmdline_opts *hsfs_opts)
+{
+        UriUriA *uri = &(hsfs_opts->target_uri);
+        struct hsfs_fs_type *fs_list, *fs = NULL;
+        int i, ret = 0;
+
+        DEBUG("URI->scheme: %s, %d\n", uri->scheme.first, uri->scheme.afterLast - uri->scheme.first);
+
+        if (hsfs_opts->is_client){
+                sb->type = HSFS_SB_CLIENT;
+                fs_list = hsfs_fs_type_list;
+        }
+        else {
+                sb->type = HSFS_SB_CLIENT;
+                fs_list = hsfs_fs_type_list + 2;
+        }
+
+        for (i = 0; i < 2; i++){
+                if (!strncmp(uri->scheme.first, fs_list[i].name,
+                             uri->scheme.afterLast - uri->scheme.first)){
+                        fs = fs_list + i;
+                        break;
+                }
+        }
+        if (!fs){
+                fprintf(stderr, "%s: Unsupported URI schema: %s\n",  progname, hsfs_opts->target_spec);
+                ret = 1;
+                goto out;
+        }
+
+        return fs->fill_super(sb, hsfs_opts);
+
 out:
         return ret;
 }
@@ -1088,10 +1294,8 @@ err_out1:
 out:
         if (opts.mountpoint != NULL)
                 free(opts.mountpoint);
-        if (hsfs_opts.client_spec)
-                free(hsfs_opts.client_spec);
-        if (hsfs_opts.server_spec)
-                free(hsfs_opts.server_spec);
+        if (hsfs_opts.target_spec)
+                free(hsfs_opts.target_spec);
 	fuse_opt_free_args(&args);
 
 	return err ? 1 : 0;

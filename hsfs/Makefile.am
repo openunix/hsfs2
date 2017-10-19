@@ -8,7 +8,7 @@ else
   FUSE_FLAGS = `pkg-config fuse3 --cflags`
 endif
 
-AM_CPPFLAGS = $(FUSE_FLAGS)
+AM_CPPFLAGS = $(FUSE_FLAGS) $(VMWARE_FLAGS)
 
 bin_PROGRAMS = hsfs
 hsfs_LDADD = $(FUSE_LIB) $(NFS3_LIB) $(NFSC_LIB) # $(top_builddir)/lib/libhsfs.a
