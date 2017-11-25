@@ -37,14 +37,16 @@ AC_ARG_WITH([system-fuse],
         [],
         [with_system_fuse=yes])
 AS_IF([test "x$with_system_fuse" == xyes],
-        [AC_CHECK_LIB([fuse3], [fuse_session_new], [],
+        [AC_CHECK_LIB([fuse3], [fuse_session_socket], [],
                 [no_fuse_lib=yes])],
         [AS_IF([test -f "fuse/configure.ac"], [],
                 [no_fuse_lib=yes])])
 AS_IF([test "x$no_fuse_lib" == xyes],
         AC_MSG_ERROR([
-FUSE (libfuse) version >= 3.0.0 not present. Your options:
-  (1) Preferred: Install the FUSE (libfuse 3.0.0 or higher) devel package
+FUSE (libfuse) version >= 3.0.0 with fuse_session_socket support not present.
+Your options:
+  (1) Preferred: Install the FUSE (libfuse 3.0.0 or higher) with support of
+      "fuse_session_socket" devel package
   (2) Fetch the FUSE submodule by using below command and ./configure --without-system-fuse
       git submodule update --init fuse]))
 

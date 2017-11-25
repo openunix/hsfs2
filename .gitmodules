@@ -1,3 +1,4 @@
 [submodule "fuse"]
 	path = fuse
-	url = https://github.com/libfuse/libfuse.git
+	url = https://github.com/openunix/vfuse.git
+	branch = socket_fuse_dev
